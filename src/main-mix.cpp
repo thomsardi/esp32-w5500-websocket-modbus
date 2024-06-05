@@ -5,6 +5,9 @@
 #include <ModbusServerEthernet.h>
 #include <defines_ethernet.h>
 
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO
+#include "esp_log.h"
+
 int internalLed = 2;
 const char* TAG = "simple tcp/ip mix test";
 IPAddress serverIp(192, 168, 2, 113);
@@ -14,7 +17,7 @@ TaskHandle_t modbusTcpServerTaskHandle;
 TaskHandle_t modbusTcpClientTaskHandle;
 TaskHandle_t webServerTaskHandle;
 
-EthernetServer server(81);
+EthernetServer server(8123);
 EthernetClient modbusClient;
 EthernetClient webSocketClient;
 EthernetWebSocketClient wsClient(webSocketClient, serverIp, 8000);
@@ -26,6 +29,7 @@ ModbusServerEthernet mbServer;
 uint16_t memo[32]; // Test server memory: 32 words
 uint8_t id = 2;
 uint8_t count = 0;
+uint32_t dataCount = 0;
 
 /**
  * Modbus TCP Server callback
@@ -84,6 +88,7 @@ void handleData(ModbusMessage response, uint32_t token)
         Serial.printf("%02X ", byte);
     }
     Serial.println("");
+    dataCount++;
 }
 
 // Define an onError handler function to receive error responses
@@ -107,19 +112,22 @@ void setupEthernet()
         // Serial.println("Ethernet shield was not found.  Sorry, can't run without hardware. :(");
         ESP_LOGI(TAG, "Ethernet shield was not found.  Sorry, can't run without hardware. :(");
         while (true) {
-        delay(1); // do nothing, no point running without Ethernet hardware
+            delay(1); // do nothing, no point running without Ethernet hardware
         }
     }
     if (Ethernet.linkStatus() == LinkOFF) {
         ESP_LOGI(TAG, "Ethernet cable is not connected.");
     }
-    ESP_LOGI(TAG, "Connected to IP : %s\n", Ethernet.localIP().toString());
+    ESP_LOGI(TAG, "Connected to IP : %s\n", Ethernet.localIP().toString().c_str());
     ESP_LOGI(TAG, "MAC Address %02X::%02X::%02X::%02X::%02X::%02X", mac[0][0], mac[0][1], mac[0][2], mac[0][3], mac[0][4], mac[0][5]);
     digitalWrite(internalLed, HIGH);
 }
 
 void tcpTask(void *pvParameter)
 {
+    const char *_TAG = "tcp task";
+    esp_log_level_set(_TAG, ESP_LOG_INFO);
+    uint32_t msgCount = 1;
     while (1)
     {
         EthernetClient ethClient = server.available();
@@ -128,19 +136,25 @@ void tcpTask(void *pvParameter)
             while (ethClient.connected())
             {
                 uint8_t buff[1024];
+                String responseText = "response %d from ESP32 => ";
+                responseText.replace("%d", String(msgCount));
                 int len = ethClient.available();
-                ESP_LOGI(TAG, "bytes length : %d\n", len);
-                ethClient.readBytes(buff, ethClient.available());
-                for (size_t i = 0; i < len; i++)
-                {
-                    ESP_LOGI(TAG, "%02X", buff[i]);
-                }
-                int byteWritten = ethClient.write("received");
-                ESP_LOGI(TAG, "bytes written : %d\n", byteWritten);
+                ESP_LOGI(_TAG, "bytes length : %d\n", len);
+                mempcpy(buff, responseText.c_str(), responseText.length());
+                ethClient.readBytes(buff + responseText.length(), len);
+                // ESP_LOG_BUFFER_HEXDUMP(_TAG, buff, len, ESP_LOG_INFO);
+                size_t length = responseText.length() + len; //ex : 0x1234
+                std::vector<uint8_t> dataLengthBytes;
+                dataLengthBytes.push_back(length >> 8); //fill second element with 0x12
+                dataLengthBytes.push_back(length & 0xFF); //fill first element with 0x34
+                int byteWritten = ethClient.write(dataLengthBytes.data(), dataLengthBytes.size()); //write to eth port as 0x1234 (send 0x12 first, then 0x34), this packet is data size of the next packet
+                byteWritten += ethClient.write(buff, length); //write data to eth port
+                ESP_LOGI(_TAG, "bytes written : %d\n", byteWritten);
+                msgCount++;
             }
         }
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-        ethClient.stop();
+        vTaskDelay(10 / portTICK_PERIOD_MS); //delay task to give another task chance
+        ethClient.stop(); //stop when finish transmit data, so the received can detect the eof character
     }
     
 }
@@ -154,7 +168,7 @@ void modbusTcpClientTask(void *pvParameter)
             ModbusError e(err);
             Serial.printf("Error creating request: %02X - %s\n", (int)e, (const char *)e);
         }
-        vTaskDelay(500 / portTICK_PERIOD_MS);
+        vTaskDelay(500 / portTICK_PERIOD_MS); //delay task to give another task chance
     }
 }
 
@@ -163,13 +177,14 @@ void webServerTask(void *pvParameter)
     while (1)
     {
         webServer.handleClient();
-        vTaskDelay(1 / portTICK_PERIOD_MS);
+        vTaskDelay(1 / portTICK_PERIOD_MS); //delay task to give another task chance
     }
 }
 
 void setup() 
 {
     // put your setup code here, to run once:
+    esp_log_level_set(TAG, ESP_LOG_INFO);
     pinMode(internalLed, OUTPUT);
     Serial.begin(115200);
     SPI.begin(21, 18, 19, 22);
@@ -213,7 +228,8 @@ void setup()
     mbClient.setTarget(serverIp, 502);
 
     webServer.on("/api/test-get", HTTP_GET, []{
-        webServer.send(200, "text/plain", "GET success");
+        String text = "data count : " + String(dataCount);
+        webServer.send(200, "text/plain", text);
     });
 
     webServer.on("/api/test-post", HTTP_POST, []{
