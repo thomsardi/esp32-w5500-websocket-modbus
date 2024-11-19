@@ -243,6 +243,7 @@ void setup()
 
 void loop()
 {
+    //websocket handle
     wsClient.begin();
     while (wsClient.connected())
     {
